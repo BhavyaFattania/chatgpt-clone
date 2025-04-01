@@ -1,27 +1,36 @@
-from json import dumps
+from json import dumps, loads
 from time import time
 from flask import request
 from hashlib import sha256
 from datetime import datetime
-from requests import get
-from requests import post 
-from json     import loads
 import os
+from groq import Groq
 
-from server.config import special_instructions
+from server.config import available_models, special_instructions
 
 
 class Backend_Api:
     def __init__(self, app, config: dict) -> None:
         self.app = app
-        self.openai_key = os.getenv("OPENAI_API_KEY") or config['openai_key']
-        self.openai_api_base = os.getenv("OPENAI_API_BASE") or config['openai_api_base']
+        self.groq_api_key = "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" or config['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']
         self.proxy = config['proxy']
         self.routes = {
             '/backend-api/v2/conversation': {
                 'function': self._conversation,
                 'methods': ['POST']
+            },
+            '/backend-api/v2/models': {
+                'function': self._get_available_models,
+                'methods': ['GET']
             }
+        }
+        self.client = Groq(api_key=self.groq_api_key)
+
+    def _get_available_models(self):
+        """Return the list of available models"""
+        return {
+            'models': available_models,
+            'success': True
         }
 
     def _conversation(self):
@@ -30,12 +39,18 @@ class Backend_Api:
             internet_access = request.json['meta']['content']['internet_access']
             _conversation = request.json['meta']['content']['conversation']
             prompt = request.json['meta']['content']['parts'][0]
+            model_name = request.json['model']  # Get the requested model name
+            
+            # Map to appropriate Groq model ID
+            groq_model = available_models.get(model_name, {}).get('id', 'llama-3.3-70b-versatile')
+            
             current_date = datetime.now().strftime("%Y-%m-%d")
-            system_message = f'You are ChatGPT also known as ChatGPT, a large language model trained by OpenAI. Strictly follow the users instructions. Knowledge cutoff: 2021-09-01 Current date: {current_date}'
+            system_message = f'You are an AI assistant. Knowledge cutoff: 2023-12-01 Current date: {current_date}'
 
             extra = []
             if internet_access:
-                search = get('https://ddg-api.herokuapp.com/search', params={
+                import requests
+                search = requests.get('https://ddg-api.herokuapp.com/search', params={
                     'query': prompt["content"],
                     'limit': 3,
                 })
@@ -52,10 +67,8 @@ class Backend_Api:
                 extra = [{'role': 'user', 'content': blob}]
 
             conversation = [{'role': 'system', 'content': system_message}] + \
-                extra + special_instructions[jailbreak] + \
+                extra + special_instructions.get(jailbreak, []) + \
                 _conversation + [prompt]
-
-            url = f"{self.openai_api_base}/v1/chat/completions"
 
             proxies = None
             if self.proxy['enable']:
@@ -63,54 +76,47 @@ class Backend_Api:
                     'http': self.proxy['http'],
                     'https': self.proxy['https'],
                 }
+                # Set proxy for requests if needed
+                os.environ['HTTP_PROXY'] = self.proxy['http']
+                os.environ['HTTPS_PROXY'] = self.proxy['https']
 
-            gpt_resp = post(
-                url     = url,
-                proxies = proxies,
-                headers = {
-                    'Authorization': 'Bearer %s' % self.openai_key
-                }, 
-                json    = {
-                    'model'             : request.json['model'], 
-                    'messages'          : conversation,
-                    'stream'            : True
-                },
-                stream  = True
-            )
-
-            if gpt_resp.status_code >= 400:
-                error_data =gpt_resp.json().get('error', {})
-                error_code = error_data.get('code', None)
-                error_message = error_data.get('message', "An error occurred")
-                return {
-                    'successs': False,
-                    'error_code': error_code,
-                    'message': error_message,
-                    'status_code': gpt_resp.status_code
-                }, gpt_resp.status_code
-
-            def stream():
-                for chunk in gpt_resp.iter_lines():
-                    try:
-                        decoded_line = loads(chunk.decode("utf-8").split("data: ")[1])
-                        token = decoded_line["choices"][0]['delta'].get('content')
-
-                        if token != None: 
-                            yield token
+            # Create streaming completion with Groq
+            try:
+                completion = self.client.chat.completions.create(
+                    model=groq_model,
+                    messages=conversation,
+                    temperature=0.7,
+                    max_tokens=1024,
+                    top_p=1,
+                    stream=True,
+                    stop=None,
+                )
+                
+                def stream():
+                    for chunk in completion:
+                        try:
+                            token = chunk.choices[0].delta.content
+                            if token is not None:
+                                yield token
+                        except GeneratorExit:
+                            break
+                        except Exception as e:
+                            print(f"Streaming error: {e}")
+                            continue
                             
-                    except GeneratorExit:
-                        break
-
-                    except Exception as e:
-                        print(e)
-                        print(e.__traceback__.tb_next)
-                        continue
-                        
-            return self.app.response_class(stream(), mimetype='text/event-stream')
+                return self.app.response_class(stream(), mimetype='text/event-stream')
+                
+            except Exception as groq_error:
+                print(f"Groq API error: {str(groq_error)}")
+                return {
+                    'success': False,
+                    'error_code': 'groq_api_error',
+                    'message': f"Groq API error: {str(groq_error)}",
+                    'status_code': 500
+                }, 500
 
         except Exception as e:
-            print(e)
-            print(e.__traceback__.tb_next)
+            print(f"General error: {str(e)}")
             return {
                 '_action': '_ask',
                 'success': False,
